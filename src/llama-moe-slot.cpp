@@ -1345,7 +1345,7 @@ struct llama_moe_slot_runtime::impl {
 
     /// 把已打开的 experts fd 的 F_NOCACHE 拨到 `on`。只改缓存行为，不动数据。
     void apply_experts_nocache(bool on) {
-#ifndef _WIN32
+#if !defined(_WIN32) && defined(F_NOCACHE)
         std::lock_guard<std::mutex> lock(fd_mutex);
         for (const auto & kv : fds) {
             if (fcntl(kv.second, F_NOCACHE, on ? 1 : 0) != 0) {
@@ -1372,9 +1372,11 @@ struct llama_moe_slot_runtime::impl {
         const int fd = _open(path.c_str(), _O_RDONLY | _O_BINARY);
 #else
         const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+#ifdef F_NOCACHE
         if (experts_nocache_desired() && fcntl(fd, F_NOCACHE, 1) != 0) {
             moe_log("F_NOCACHE 设置失败: %s", std::strerror(errno));
         }
+#endif
 #endif
         if (fd < 0) {
             throw std::runtime_error(format("failed to open MoE experts file '%s': %s", path.c_str(), std::strerror(errno)));

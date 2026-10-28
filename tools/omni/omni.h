@@ -311,6 +311,12 @@ struct omni_context {
     // 每个 chunk 最大生成 token 数（用于限制单次 speak 长度，便于及时响应打断）
     // 设置为 0 表示无限制
     int max_new_speak_tokens_per_chunk = 26;
+
+    // Duplex text repetition penalty, applied like Python StreamDecoder.decode:
+    // only over recently generated non-special tokens (not <|listen|> etc.).
+    float duplex_rep_penalty = 1.05f;
+    int duplex_rep_window = 512;
+    std::vector<llama_token> duplex_generated_tokens;
     
     // listen_prob_scale: 调整 <|listen|> token 的采样概率
     // 1.0: Python 默认

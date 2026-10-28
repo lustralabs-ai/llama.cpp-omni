@@ -15,6 +15,7 @@
 #include "protocol.h"
 #include "omni.h"
 #include "common.h"
+#include "sampling.h"
 #include "llama.h"
 #include "log.h"
 #include "audition.h"
@@ -168,6 +169,24 @@ static void stop_reusable_octx_threads(omni_context * octx) {
     omni_prepare_for_reuse(octx);
 }
 
+// Duplex system prompt, matching the Python backend's duplex_prepare:
+//   <|im_start|>system\n{text}\n<|audio_start|>[ref audio]<|audio_end|><|im_end|>\n
+// stream_prefill(index=0) fills in the ref audio between prefix and suffix.
+// Turn-based prompts are configured per turn by configure_turn_based_prompt.
+static void apply_init_system_prompt(omni_context * octx, const ParsedSessionInit & init) {
+    if (init.system_prompt.empty()) {
+        return;
+    }
+    if (!octx->duplex_mode) {
+        octx->omni_assistant_prompt = init.system_prompt;
+        return;
+    }
+    octx->omni_voice_clone_prompt = "<|im_start|>system\n" + init.system_prompt + "\n<|audio_start|>";
+    octx->omni_assistant_prompt = "<|audio_end|><|im_end|>\n";
+    octx->audio_voice_clone_prompt = octx->omni_voice_clone_prompt;
+    octx->audio_assistant_prompt = octx->omni_assistant_prompt;
+}
+
 // Wipe per-session state on a reused context: stop threads, reset counters/flags,
 // clear LLM/TTS/whisper KV caches, so the next session starts clean on the same
 // loaded model. Used by the shared-octx reuse path in create_session_octx.
@@ -223,14 +242,12 @@ static void reset_octx_for_session(omni_context * octx, const ParsedSessionInit 
         vision_set_max_slice_nums(octx->ctx_vision, -1);
     }
 
-    if (!init.system_prompt.empty()) {
-        octx->omni_assistant_prompt = init.system_prompt;
-    }
+    apply_init_system_prompt(octx, init);
 }
 
 // Apply the optional opaque init.config (sampling/decoding knobs, §6) onto the
 // context and params. Unknown/missing keys are left at model defaults.
-static void apply_session_config(common_params & params, omni_context * octx, const ParsedSessionInit & init) {
+static void apply_config_knobs(common_params & params, omni_context * octx, const ParsedSessionInit & init) {
     if (!init.config.is_object()) {
         return;
     }
@@ -256,9 +273,35 @@ static void apply_session_config(common_params & params, omni_context * octx, co
     if (init.config.contains("top_p") && init.config.at("top_p").is_number()) {
         params.sampling.top_p = init.config.at("top_p").get<float>();
     }
+    if (init.config.contains("text_repetition_penalty") && init.config.at("text_repetition_penalty").is_number()) {
+        octx->duplex_rep_penalty = init.config.at("text_repetition_penalty").get<float>();
+    }
     if (init.config.contains("top_k") && init.config.at("top_k").is_number_integer()) {
         params.sampling.top_k = init.config.at("top_k").get<int>();
     }
+}
+
+static void apply_session_config(common_params & params, omni_context * octx, const ParsedSessionInit & init) {
+    if (octx->duplex_mode) {
+        // DuplexConfig defaults from the Python demo (core/schemas/duplex.py).
+        params.sampling.temp           = 0.7f;
+        params.sampling.top_k          = 20;
+        params.sampling.top_p          = 0.8f;
+        // Repetition penalty is applied in omni.cpp over non-special tokens only,
+        // like Python; the stock sampler would also penalise <|listen|> etc.
+        params.sampling.penalty_repeat = 1.0f;
+        octx->duplex_rep_penalty = 1.05f;
+        octx->duplex_generated_tokens.clear();
+        octx->max_new_speak_tokens_per_chunk = 20;
+        octx->length_penalty                 = 1.1f;
+    }
+    apply_config_knobs(params, octx, init);
+    // The sampler chain is built in omni_init from the params of that time, so
+    // rebuild it or the per-session sampling settings never take effect.
+    if (octx->ctx_sampler) {
+        common_sampler_free(octx->ctx_sampler);
+    }
+    octx->ctx_sampler = common_sampler_init(octx->model, params.sampling);
 }
 
 // ============================================================================
@@ -558,9 +601,7 @@ static omni_context * create_session_octx(common_params & params, const ParsedSe
     apply_session_config(p, octx, init);
 
     // Voice clone / system prompt
-    if (!init.system_prompt.empty()) {
-        octx->omni_assistant_prompt = init.system_prompt;
-    }
+    apply_init_system_prompt(octx, init);
     shared_octx = octx;
 
     LOG_INF("create_session_octx: session octx created, duplex=%d, output_dir=%s\n",

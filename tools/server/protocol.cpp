@@ -286,9 +286,16 @@ ParsedSessionInit parse_session_init(const json & msg) {
         const json & v = p.at("voice");
         out.ref_audio_b64 = json_str_any(v, {"ref_audio", "ref_audio_base64"});
         out.tts_ref_audio_b64 = json_str_any(v, {"tts_ref_audio", "tts_ref_audio_base64"});
-        if (out.tts_ref_audio_b64.empty() && !out.ref_audio_b64.empty()) {
-            out.tts_ref_audio_b64 = out.ref_audio_b64;
-        }
+    }
+    // The MiniCPM-o-Demo web clients send these at the top level of the payload.
+    if (out.ref_audio_b64.empty()) {
+        out.ref_audio_b64 = json_str_any(p, {"ref_audio_base64", "ref_audio"});
+    }
+    if (out.tts_ref_audio_b64.empty()) {
+        out.tts_ref_audio_b64 = json_str_any(p, {"tts_ref_audio_base64", "tts_ref_audio"});
+    }
+    if (out.tts_ref_audio_b64.empty() && !out.ref_audio_b64.empty()) {
+        out.tts_ref_audio_b64 = out.ref_audio_b64;
     }
 
     // system_prompt

@@ -1,3 +1,4 @@
+#include <unordered_set>
 #include "omni-impl.h"
 #include "vision.h"
 #include "audition.h"
@@ -1327,6 +1328,40 @@ static const char * sample_with_hidden_and_token(struct common_sampler * smpl, s
     
     // 🔧 [双工模式] 在采样前调整 logits
     if (ctx_omni->duplex_mode) {
+        // Python StreamDecoder.decode: sample once from the raw softmax; if that
+        // yields <|chunk_eos|> end the unit, otherwise forbid chunk_eos and run
+        // the normal penalised sampler. Without this the full sampler chain
+        // makes chunk_eos rare, the LLM emits more text per unit than the TTS
+        // can speak in its 1 s budget, and words get dropped.
+        const llama_token chunk_eos = ctx_omni->special_token_chunk_eos;
+        std::mt19937 * rng = static_cast<std::mt19937 *>(common_sampler_get_rng(smpl));
+        if (logits != nullptr && chunk_eos >= 0 && rng != nullptr) {
+            const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama)));
+            float max_l = -INFINITY;
+            for (int i = 0; i < n_vocab; ++i) max_l = std::max(max_l, logits[i]);
+            double sum = 0.0;
+            for (int i = 0; i < n_vocab; ++i) sum += std::exp((double)(logits[i] - max_l));
+            const double p_eos = std::exp((double)(logits[chunk_eos] - max_l)) / sum;
+            std::uniform_real_distribution<double> u(0.0, 1.0);
+            if (u(*rng) < p_eos) {
+                token_id = chunk_eos;
+                common_sampler_accept(smpl, chunk_eos, true);
+                static std::string eos_piece;
+                eos_piece = common_token_to_piece(ctx_omni->ctx_llama, chunk_eos);
+                eval_id_with_hidden(ctx_omni, params, chunk_eos, n_past, hidden_states);
+                return eos_piece.c_str();
+            }
+            logits[chunk_eos] = -INFINITY;
+        }
+        if (logits != nullptr && ctx_omni->duplex_rep_penalty != 1.0f) {
+            const auto & gen = ctx_omni->duplex_generated_tokens;
+            const size_t start = gen.size() > (size_t)ctx_omni->duplex_rep_window ? gen.size() - ctx_omni->duplex_rep_window : 0;
+            std::unordered_set<llama_token> seen(gen.begin() + start, gen.end());
+            for (llama_token t : seen) {
+                float & l = logits[t];
+                l = l > 0 ? l / ctx_omni->duplex_rep_penalty : l * ctx_omni->duplex_rep_penalty;
+            }
+        }
         if (logits != nullptr) {
             // 1. 调整 <|listen|> 的 logit（listen_prob_scale）
             // listen_prob_scale > 1.0 会增加 <|listen|> 的概率，让模型更倾向于先听
@@ -1379,6 +1414,12 @@ static const char * sample_with_hidden_and_token(struct common_sampler * smpl, s
     const llama_token id = common_sampler_sample(smpl, ctx_omni->ctx_llama, -1);
     token_id = id;  // 保存token ID
     common_sampler_accept(smpl, id, true);
+    if (ctx_omni->duplex_mode) {
+        const auto * vocab = llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama));
+        if (!(llama_vocab_get_attr(vocab, id) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED))) {
+            ctx_omni->duplex_generated_tokens.push_back(id);
+        }
+    }
     static std::string ret;
     if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama)), id)) {
         ret = "</s>";
@@ -5687,7 +5728,9 @@ static bool generate_audio_tokens_local(
     // 🔧 [单双工适配] max_audio_tokens:
     // - 双工模式: 26 (与 Python 对齐，max_token_per_chunk = 25 + 1)
     // - 单工模式: 500 (允许更长的生成，靠 EOS 结束)
-    const int max_audio_tokens = ctx_omni->duplex_mode ? 26 : 500;
+    // The last chunk of a turn may carry text the LLM ran ahead with; give it
+    // room to finish speaking (stops at the TTS EOS) instead of cutting it off.
+    const int max_audio_tokens = ctx_omni->duplex_mode ? (is_end_of_turn ? 26 * 6 : 26) : 500;
     print_with_timestamp("TTS Local: mode=%s, max_audio_tokens=%d\n", 
                          ctx_omni->duplex_mode ? "duplex" : "simplex", max_audio_tokens);
     
@@ -5896,7 +5939,9 @@ static bool generate_audio_tokens_local(
         // 🔧 [与 Python 对齐] is_end_of_turn 时不进行流式推送，让所有 tokens 在最后一起发送
         // 这样 T2W 才能一次性 flush 所有 buffer，输出完整音频
         int push_threshold = first_chunk_pushed ? STREAM_CHUNK_SIZE : FIRST_CHUNK_SIZE;
-        if ((int)stream_buffer.size() >= push_threshold && ctx_omni->t2w_thread_info && !is_end_of_turn) {
+        // Long end-of-turn chunks stream too; the final push below still flushes.
+        if ((int)stream_buffer.size() >= push_threshold && ctx_omni->t2w_thread_info
+            && (!is_end_of_turn || ctx_omni->duplex_mode)) {
             first_chunk_pushed = true;
             T2WOut *t2w_out = new T2WOut();
             t2w_out->audio_tokens.assign(stream_buffer.begin(), stream_buffer.end());
@@ -6256,6 +6301,9 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
     // 🔧 [修复重复生成问题] 标志位：当前 turn 是否已经执行过 turn_eos flush
     bool turn_eos_flushed = false;
 
+    // Whether the last chunk handed to TTS ended a turn (or nothing was spoken yet).
+    bool duplex_turn_ended = true;
+
     print_with_timestamp("TTS thread (duplex mode) started\n");
 
     // Multi Round Persistent Loop
@@ -6284,6 +6332,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
             audio_tokens.clear();
             all_audio_tokens.clear();
             incomplete_bytes.clear();
+            duplex_turn_ended = true;
             // 清除 TTS KV cache
             llama_memory_t mem = llama_get_memory(ctx_omni->ctx_tts_llama);
             if (mem) {
@@ -6370,10 +6419,21 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                                 accumulated_is_end_of_turn ? 1 : 0,
                                 llm_text.size());
             
+            // speek_done is also set by this thread after every chunk, so when
+            // TTS lags behind the LLM it is still true when the next mid-turn
+            // chunk arrives. Only treat data as a new SPEAK after a real turn end.
+            const bool new_speak_turn = duplex_turn_ended;
+            if (ctx_omni->duplex_mode && !current_chunk_token_ids.empty()) {
+                duplex_turn_ended = false;
+            }
+            if (accumulated_is_end_of_turn) {
+                duplex_turn_ended = true;
+            }
+
             if (ctx_omni->speek_done && llm_finish) {
                 if (ctx_omni->duplex_mode && !current_chunk_token_ids.empty()) {
                     // 新一轮 SPEAK：重置 TTS 状态，防止上轮残留污染
-                    if (chunk_idx > 0) {
+                    if (chunk_idx > 0 && new_speak_turn) {
                         chunk_idx = 0;
                         tts_n_past = 0;
                         audio_tokens.clear();

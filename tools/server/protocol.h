@@ -69,6 +69,11 @@ json make_response_done(const std::string & session_id,
                         const ProtocolMetrics & metrics = {});
 
 // session.closed — session ended
+// Reply to a session.reset (duplex context reset with a new system prompt).
+json make_session_reset_done(const std::string & session_id,
+                             bool ok,
+                             const ProtocolMetrics & metrics);
+
 json make_session_closed(const std::string & session_id,
                          const std::string & reason = "client_closed",
                          const std::string & diagnostic_message = "");

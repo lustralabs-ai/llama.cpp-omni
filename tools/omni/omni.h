@@ -537,6 +537,11 @@ bool stream_prefill(struct omni_context * ctx_omni,
                                                      // 在 index>=1 的用户输入阶段插入到当前 user turn 中。
                                                      // 不会自动包裹任何 role/special token —— 调用方完全控制其字面值。
 
+// Duplex only, between steps: clear the LLM KV and re-run the index=0 system
+// prompt init (current omni_voice_clone_prompt/omni_assistant_prompt + ref audio)
+// without restarting threads or the session. TTS/T2W state is left untouched.
+bool omni_duplex_reset_context(struct omni_context * ctx_omni, const std::string & ref_audio_path);
+
 bool stream_decode(struct omni_context * ctx_omni,
                         std::string debug_dir,
                         int round_idx = -1);  // round_idx: 由调用方指定的轮次索引，-1 表示使用内部计数

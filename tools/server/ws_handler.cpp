@@ -816,6 +816,45 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             msg_type = msg.at("type").get<std::string>();
         }
 
+        if (msg_type == "session.reset") {
+            // Same-session context reset (duplex): clear the LLM KV and re-prefill
+            // the system prompt (optionally replaced) + ref audio. The read loop is
+            // only here between steps, so no decode is in flight.
+            if (parsed_init.mode != "full_duplex") {
+                fail_fast(session_id, "reset_unsupported_mode");
+                return;
+            }
+            const json & payload = msg.contains("payload") && msg.at("payload").is_object()
+                ? msg.at("payload") : json::object();
+            if (payload.contains("system_prompt") && payload.at("system_prompt").is_string()) {
+                const std::string sp = payload.at("system_prompt").get<std::string>();
+                if (!sp.empty()) {
+                    parsed_init.system_prompt = sp;
+                }
+            }
+            std::string voice_wav;
+            if (!parsed_init.ref_audio_b64.empty()) {
+                voice_wav = TempMediaFiles::write_audio_wav(parsed_init.ref_audio_b64, temp_dir, msg_counter++);
+            }
+            const auto t_reset_start = std::chrono::steady_clock::now();
+            bool ok = false;
+            {
+                std::lock_guard<std::mutex> lock(octx_mutex);
+                apply_init_system_prompt(octx, parsed_init);
+                ok = omni_duplex_reset_context(octx, voice_wav);
+            }
+            if (!voice_wav.empty()) fs::remove(voice_wav);
+            if (!ok) {
+                fail_fast(session_id, "reset_failed");
+                return;
+            }
+            LOG_INF("WS /backend: session %s context reset in %.0f ms\n",
+                    session_id.c_str(), elapsed_ms(t_reset_start));
+            send_event(make_session_reset_done(session_id, ok,
+                make_runtime_metrics(octx, elapsed_ms(t_reset_start), 0.0, elapsed_ms(t_reset_start))));
+            continue;
+        }
+
         if (msg_type != "input.append") {
             // Unknown or invalid type after init → fail-fast
             LOG_ERR("WS /backend: unexpected message type '%s' from session %s\n",

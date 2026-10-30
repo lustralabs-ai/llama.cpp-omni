@@ -5237,11 +5237,78 @@ static bool is_valid_tts_token(llama_token tid) {
     return true;
 }
 
+// Emoji are used as out-of-band state markers in the text stream (the client
+// parses and strips them); they must never reach TTS. Default on; set
+// OMNI_TTS_STRIP_EMOJI=0 to disable.
+static bool tts_strip_emoji_enabled() {
+    static const bool enabled = [] {
+        const char * v = getenv("OMNI_TTS_STRIP_EMOJI");
+        return !(v && (v[0] == '0' || v[0] == 'n' || v[0] == 'N' || v[0] == 'f' || v[0] == 'F'));
+    }();
+    return enabled;
+}
+
+static bool is_emoji_codepoint(uint32_t cp) {
+    return (cp >= 0x2300 && cp <= 0x23FF)     // misc technical (⌚ ⏰ ⏩ ...)
+        || (cp >= 0x2600 && cp <= 0x27BF)     // misc symbols + dingbats (☀ ✅ ✋ ❌ ...)
+        || (cp >= 0x2B00 && cp <= 0x2BFF)     // arrows/shapes (⬆ ⭐ ...)
+        || (cp >= 0x1F000 && cp <= 0x1FAFF)   // emoji planes
+        || (cp >= 0xE0020 && cp <= 0xE007F)   // tag sequences
+        || cp == 0xFE0F || cp == 0x200D || cp == 0x20E3;
+}
+
+// Mark tokens contributing bytes to an emoji code point. Byte-level BPE may split
+// one emoji over several tokens, so decode the concatenated bytes of the chunk.
+static std::vector<bool> emoji_token_mask(const llama_vocab * vocab, const std::vector<llama_token> & token_ids) {
+    std::vector<bool> mask(token_ids.size(), false);
+    if (!vocab) return mask;
+    std::string bytes;
+    std::vector<size_t> owner;
+    char buf[256];
+    for (size_t i = 0; i < token_ids.size(); ++i) {
+        int n = llama_token_to_piece(vocab, token_ids[i], buf, sizeof(buf), 0, false);
+        for (int k = 0; k < n; ++k) {
+            bytes.push_back(buf[k]);
+            owner.push_back(i);
+        }
+    }
+    size_t p = 0;
+    while (p < bytes.size()) {
+        const unsigned char c = (unsigned char)bytes[p];
+        int len = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 0;
+        if (len == 0) { p++; continue; }  // stray continuation byte
+        if (p + len > bytes.size()) {
+            // Truncated at chunk end: an emoji lead (F0 9F / E2 8C-9F,AC-AF) is enough.
+            const unsigned char c1 = p + 1 < bytes.size() ? (unsigned char)bytes[p + 1] : 0;
+            const bool lead = (c == 0xF0 && c1 == 0x9F)
+                || (c == 0xE2 && ((c1 >= 0x8C && c1 <= 0x8F) || (c1 >= 0x98 && c1 <= 0x9F) || (c1 >= 0xAC && c1 <= 0xAF)));
+            if (lead) {
+                for (size_t q = p; q < bytes.size(); ++q) mask[owner[q]] = true;
+            }
+            break;
+        }
+        uint32_t cp = len == 1 ? c : len == 2 ? (c & 0x1F) : len == 3 ? (c & 0x0F) : (c & 0x07);
+        bool ok = true;
+        for (int k = 1; k < len; ++k) {
+            const unsigned char cc = (unsigned char)bytes[p + k];
+            if ((cc & 0xC0) != 0x80) { ok = false; break; }
+            cp = (cp << 6) | (cc & 0x3F);
+        }
+        if (!ok) { p++; continue; }
+        if (is_emoji_codepoint(cp)) {
+            for (int k = 0; k < len; ++k) mask[owner[p + k]] = true;
+        }
+        p += len;
+    }
+    return mask;
+}
+
 // Helper function to filter special tokens (matching Python file_loader.py logic)
 static void filter_special_tokens(
     std::vector<llama_token>& token_ids,
     std::vector<float>& hidden_states,
-    int n_embd
+    int n_embd,
+    const llama_vocab * vocab = nullptr
 ) {
     // Validate input: hidden_states should have size = token_ids.size() * n_embd
     if (hidden_states.size() != token_ids.size() * n_embd) {
@@ -5257,11 +5324,17 @@ static void filter_special_tokens(
     std::vector<llama_token> filtered_token_ids;
     std::vector<float> filtered_hidden_states;
     
+    std::vector<bool> emoji_mask;
+    if (vocab && tts_strip_emoji_enabled()) {
+        emoji_mask = emoji_token_mask(vocab, token_ids);
+    }
+
     for (size_t i = 0; i < token_ids.size(); ++i) {
         llama_token tid = token_ids[i];
         
         // Use the shared is_valid_tts_token function
         if (!is_valid_tts_token(tid)) continue;
+        if (!emoji_mask.empty() && emoji_mask[i]) continue;
         
         // Keep this token and its corresponding hidden state
         filtered_token_ids.push_back(tid);
@@ -6615,7 +6688,8 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
             int n_tokens_orig = (int)(current_chunk_hidden_states.size() / current_chunk_n_embd);
             std::vector<llama_token> filtered_token_ids = current_chunk_token_ids;
             std::vector<float> filtered_hidden_states = current_chunk_hidden_states;
-            filter_special_tokens(filtered_token_ids, filtered_hidden_states, current_chunk_n_embd);
+            filter_special_tokens(filtered_token_ids, filtered_hidden_states, current_chunk_n_embd,
+                                  llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama)));
             int n_tokens_filtered = (int)(filtered_hidden_states.size() / current_chunk_n_embd);
             
             if (n_tokens_filtered <= 0) {
@@ -7353,7 +7427,8 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
             
             std::vector<llama_token> filtered_token_ids = current_chunk_token_ids;
             std::vector<float> filtered_hidden_states = current_chunk_hidden_states;
-            filter_special_tokens(filtered_token_ids, filtered_hidden_states, current_chunk_n_embd);
+            filter_special_tokens(filtered_token_ids, filtered_hidden_states, current_chunk_n_embd,
+                                  llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama)));
             
             int n_tokens_filtered = (int)(filtered_hidden_states.size() / current_chunk_n_embd);
             
@@ -10468,6 +10543,88 @@ static void t2w_apply_voice(struct omni_context * ctx_omni, const std::string & 
     }
     print_with_timestamp("Token2Wav voice: %s (%.0f ms)\n", ctx_omni->t2w_voice_key.c_str(),
                          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+}
+
+// Same-session duplex context reset: clear the LLM KV (system prompt included)
+// and re-run the index=0 init with whatever omni_voice_clone_prompt /
+// omni_assistant_prompt the caller has set. Must be called between steps (no
+// decode in progress). The TTS/T2W threads and their KV are left alone so the
+// tail of the previous reply keeps playing.
+bool omni_duplex_reset_context(struct omni_context * ctx_omni, const std::string & ref_audio_path) {
+    if (!ctx_omni || !ctx_omni->duplex_mode || !ctx_omni->ctx_llama) {
+        return false;
+    }
+    DuplexPipeline * dup = ctx_omni->duplex;
+    if (dup) {
+        // Let the encoder finish anything queued (force_listen steps leave prefill
+        // packets in flight with no decode to consume them), then drop the packets.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (std::chrono::steady_clock::now() < deadline) {
+            bool encoder_idle;
+            {
+                std::lock_guard<std::mutex> lk(dup->encoder_mtx);
+                encoder_idle = dup->encoder_queue.empty();
+            }
+            size_t queued;
+            {
+                std::lock_guard<std::mutex> lk(dup->llm_mtx);
+                queued = dup->prefill_queue.size();
+            }
+            if (encoder_idle && dup->in_flight_prefill.load() <= (int)queued) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        {
+            std::lock_guard<std::mutex> lk(dup->llm_mtx);
+            int n_dropped = 0;
+            while (!dup->prefill_queue.empty()) {
+                delete dup->prefill_queue.front();
+                dup->prefill_queue.pop();
+                n_dropped++;
+            }
+            if (n_dropped > 0) {
+                dup->in_flight_prefill.fetch_sub(n_dropped);
+            }
+            if (dup->in_flight_prefill.load() != 0) {
+                print_with_timestamp("omni_duplex_reset_context: %d prefill(s) still in flight after wait\n",
+                                     dup->in_flight_prefill.load());
+                dup->in_flight_prefill.store(0);
+            }
+        }
+        dup->in_flight_cv.notify_all();
+        dup->llm_cv.notify_all();
+    }
+
+    const int old_n_past = ctx_omni->n_past;
+    llama_memory_t mem = llama_get_memory(ctx_omni->ctx_llama);
+    if (mem) {
+        llama_memory_clear(mem, /*data=*/false);
+    }
+    ctx_omni->n_past = 0;
+    ctx_omni->n_keep = 0;
+    ctx_omni->round_start_positions.clear();
+    ctx_omni->duplex_generated_tokens.clear();
+    if (ctx_omni->ctx_sampler) {
+        common_sampler_reset(ctx_omni->ctx_sampler);
+    }
+    sliding_window_reset(ctx_omni);
+    ctx_omni->slide_last_was_listen = true;
+    ctx_omni->ended_with_listen     = true;
+    ctx_omni->current_turn_ended    = false;
+    ctx_omni->break_event.store(false);
+    {
+        std::lock_guard<std::mutex> lk(ctx_omni->text_mtx);
+        ctx_omni->text_queue.clear();
+        ctx_omni->text_done_flag = false;
+        ctx_omni->text_streaming = false;
+    }
+    ctx_omni->system_prompt_initialized = false;
+
+    const bool ok = stream_prefill(ctx_omni, ref_audio_path, "", 0);
+    print_with_timestamp("omni_duplex_reset_context: n_past %d -> %d, n_keep=%d, ok=%d\n",
+                         old_n_past, ctx_omni->n_past, ctx_omni->n_keep, (int)ok);
+    return ok;
 }
 
 bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::string img_fname, int index, int max_slice_nums, std::string text) {

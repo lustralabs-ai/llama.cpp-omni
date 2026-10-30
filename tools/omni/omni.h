@@ -501,8 +501,9 @@ bool omni_eval_embed(struct llama_context * ctx_llama, const struct omni_embed *
 void omni_embed_free(struct omni_embed * embed);
 struct omni_embed * omni_image_embed_make_with_bytes(struct vision_ctx * ctx_vision, int n_threads, const unsigned char * image_bytes, int image_bytes_length);
 struct omni_embed * omni_image_embed_make_with_filename(struct vision_ctx * ctx_vision, int n_threads, std::string image_path);
-struct omni_embed * omni_audio_embed_make_with_bytes(struct audition_ctx * ctx_audition, int n_threads, audition_audio_f32 * audio);
-struct omni_embed * omni_audio_embed_make_with_filename(struct audition_ctx * ctx_audition, int n_threads, std::string audio_path);
+struct omni_embed * omni_audio_embed_make_with_bytes(struct audition_ctx * ctx_audition, int n_threads, struct audition_audio_u8 * audio, bool streaming = false);
+// streaming: duplex user audio, see audition_audio_preprocess_stream
+struct omni_embed * omni_audio_embed_make_with_filename(struct audition_ctx * ctx_audition, int n_threads, std::string audio_path, bool streaming = false);
 
 //
 // omni main

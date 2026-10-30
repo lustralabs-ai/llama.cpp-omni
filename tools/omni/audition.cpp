@@ -227,6 +227,14 @@ struct audition_ctx {
     struct whisper_kv_cache whisper_kv_cache;
     bool whisper_streaming_mode = true;
 
+    // audition_audio_preprocess_stream state (Python StreamingMelProcessorExact)
+    struct {
+        std::vector<float> buf;      // accumulated 16 kHz audio (slides 10 s once it reaches 30 s)
+        int64_t base_T = 0;          // global mel frame of buf[0]
+        int64_t last_emitted_T = 0;  // global mel frame where the next core chunk starts
+        int n_chunks = 0;
+    } mel_stream;
+
     // for debugging
     bool debug_graph = false;
     std::vector<ggml_tensor *> debug_print_tensors;
@@ -386,6 +394,14 @@ struct audition_graph {
             cur = ggml_add(ctx0, cur, model.whisper_e_conv_2_b);
             cur = ggml_gelu(ctx0, cur);
         }
+
+        // drop the conv frames that only exist as CNN context (time is ne[0])
+        const int n_conv = cur->ne[0];
+        const bool trimmed = audio.trim_prefix > 0 || audio.trim_suffix > 0;
+        if (trimmed) {
+            cur = ggml_view_2d(ctx0, cur, n_conv - audio.trim_prefix - audio.trim_suffix, cur->ne[1],
+                               cur->nb[1], audio.trim_prefix * cur->nb[0]);
+        }
         
         {
             // sequence length after conv
@@ -410,7 +426,8 @@ struct audition_graph {
             // If effective_iter exceeds the buffer capacity, use modulo to wrap around
             // or reset KV cache if it's too large
             size_t e_pe_offset;
-            if (effective_iter >= n_iter) {
+            // Python resets once cache_len + untrimmed conv frames reaches n_audio_ctx
+            if (effective_iter >= n_iter || (trimmed && effective_iter * n_tokens + n_conv >= n_audio_ctx)) {
                 // Position encoding buffer is exhausted, reset KV cache
                 LOG_WRN("%s: Position encoding buffer exhausted (effective_iter=%d >= n_iter=%d), resetting KV cache\n",
                         __func__, effective_iter, n_iter);
@@ -1518,7 +1535,9 @@ bool audition_audio_batch_encode(audition_ctx * ctx, const int n_threads, const 
         // After conv2 stride=2: 100/2 = 50 tokens
         // Note: pooling happens later in projector, so n_tokens here is before pooling
         const int input_frames = audios.entries[0]->nx;
-        const int n_tokens = input_frames / 2; // After conv2 with stride=2
+        const int n_tokens = audios.entries[0]->trim_prefix || audios.entries[0]->trim_suffix
+            ? (input_frames - 1) / 2 + 1 - audios.entries[0]->trim_prefix - audios.entries[0]->trim_suffix
+            : input_frames / 2; // After conv2 with stride=2
         
         const int current_total_tokens = ctx->whisper_kv_cache.iter * n_tokens;
         const int new_total_tokens = current_total_tokens + n_tokens;
@@ -1959,6 +1978,39 @@ static bool log_mel_spectrogram(
     return true;
 }
 
+// Raw log10 mel of the whole signal as Python's whisper feature extractor computes it:
+// center=True (reflect pad n_fft/2 both sides), last frame dropped, no clamp/scale.
+static void log_mel_raw(const std::vector<float> & samples, const whisper_filters & filters, int n_threads, whisper_mel & mel) {
+    const int frame_size = WHISPER_N_FFT;
+    const int frame_step = WHISPER_HOP_LENGTH;
+    const int pad = frame_size / 2;
+    const int n = (int) samples.size();
+
+    std::vector<float> padded(n + 2 * pad);
+    std::copy(samples.begin(), samples.end(), padded.begin() + pad);
+    for (int i = 0; i < pad; i++) {
+        padded[pad - 1 - i] = samples[i + 1];
+        padded[pad + n + i] = samples[n - 2 - i];
+    }
+
+    mel.n_mel = filters.n_mel;
+    mel.n_len = n / frame_step;
+    mel.n_len_org = mel.n_len;
+    mel.data.assign((size_t) mel.n_mel * mel.n_len, 0.0f);
+
+    const float * hann = global_cache.hann_window;
+    std::vector<std::thread> workers(n_threads - 1);
+    for (int iw = 0; iw < n_threads - 1; ++iw) {
+        workers[iw] = std::thread(log_mel_spectrogram_worker_thread, iw + 1, hann, std::cref(padded),
+                                  (int) padded.size(), frame_size, frame_step, n_threads,
+                                  std::cref(filters), std::ref(mel));
+    }
+    log_mel_spectrogram_worker_thread(0, hann, padded, (int) padded.size(), frame_size, frame_step, n_threads, filters, mel);
+    for (auto & w : workers) {
+        w.join();
+    }
+}
+
 bool preprocess_audio(
         const float * samples,
         size_t n_samples,
@@ -2121,5 +2173,112 @@ bool audition_audio_preprocess(
     LOG_INF("%s: Mel spectrogram ready - n_len=%d, n_mel=%d, total_size=%zu\n",
             __func__, mel_f32->nx, mel_f32->ny, mel_f32->buf.size());
     
+    return true;
+}
+
+void audition_audio_stream_reset(audition_ctx * ctx) {
+    ctx->mel_stream.buf.clear();
+    ctx->mel_stream.base_T = 0;
+    ctx->mel_stream.last_emitted_T = 0;
+    ctx->mel_stream.n_chunks = 0;
+}
+
+bool audition_audio_preprocess_stream(
+    audition_ctx * ctx,
+    audition_audio_u8 * audio,
+    audition_audio_f32 ** out_mel) {
+    const int sr = 16000;
+    const int hop = WHISPER_HOP_LENGTH;
+    const int chunk_samples = sr;    // chunk_ms=1000
+    const int first_pad = 480;       // Python's first window is 1035 ms (16480 samples, hop-aligned)
+    const int redundancy = 2;        // cnn_redundancy_ms=20
+    const int64_t slide_trigger = 30 * sr, slide_stride = 10 * sr;
+
+    std::vector<float> pcm;
+    if (!decode_audio_from_buf(audio->buf.data(), audio->buf.size(), sr, pcm)) {
+        LOG_ERR("%s: Failed to decode audio data\n", __func__);
+        return false;
+    }
+    if (pcm.empty() || pcm.size() % chunk_samples != 0) {
+        // the stream advances in whole 1 s units, pad a short chunk with silence
+        pcm.resize((pcm.size() / chunk_samples + 1) * chunk_samples, 0.0f);
+    }
+
+    auto & st = ctx->mel_stream;
+    if (st.n_chunks == 0) {
+        // a new stream starts from an empty whisper KV (e.g. not after the ref audio)
+        audition_whisper_clear_kv_cache(ctx);
+        // pad the front so the first 1 s chunk fills the 1035 ms first window and later
+        // chunks emit exactly one 100-frame unit each
+        st.buf.assign(first_pad, 0.0f);
+        st.base_T = 0;
+        st.last_emitted_T = 0;
+    }
+    st.buf.insert(st.buf.end(), pcm.begin(), pcm.end());
+
+    // trigger-mode sliding window
+    int64_t L = (int64_t) st.buf.size();
+    if (L >= slide_trigger) {
+        const int64_t guard = std::min<int64_t>(sr, L - slide_stride);
+        int64_t drop = std::min<int64_t>(slide_stride, std::max<int64_t>(0, L - guard));
+        drop = drop / hop * hop;
+        if (drop > 0) {
+            st.buf.erase(st.buf.begin(), st.buf.begin() + drop);
+            st.base_T += drop / hop;
+            L = (int64_t) st.buf.size();
+        }
+    }
+
+    whisper_preprocessor::whisper_filters filters = audition_get_mel_filters(ctx);
+    if (filters.n_mel == 0 || filters.n_fft == 0) {
+        LOG_ERR("%s: Mel filters not available in model\n", __func__);
+        return false;
+    }
+    whisper_preprocessor::whisper_mel mel;
+    whisper_preprocessor::log_mel_raw(st.buf, filters, 4, mel);
+
+    // fixed floor -10 below 5 s of buffer, else dynamic range 8 over the whole buffer
+    float floor_v = -10.0f;
+    if (L >= 5 * sr) {
+        floor_v = *std::max_element(mel.data.begin(), mel.data.end()) - 8.0f;
+    }
+    for (auto & v : mel.data) {
+        v = (std::max(v, floor_v) + 4.0f) / 4.0f;
+    }
+
+    const int64_t T_full = mel.n_len;
+    const int64_t stable_g = st.base_T + std::min<int64_t>(T_full, (L - WHISPER_N_FFT / 2) / hop + 1);
+    const int64_t core_start = st.last_emitted_T;
+    const int64_t n_core = (stable_g - redundancy - core_start) / 10 * 10;
+    if (n_core <= 0) {
+        LOG_ERR("%s: no stable mel frames (stable=%lld, core_start=%lld)\n", __func__, (long long) stable_g, (long long) core_start);
+        return false;
+    }
+    const int64_t core_end = core_start + n_core;
+    const int64_t emit_start_g = std::max<int64_t>(0, core_start - redundancy);
+    const int64_t emit_start = std::clamp<int64_t>(emit_start_g - st.base_T, 0, T_full);
+    const int64_t emit_end = std::clamp<int64_t>(core_end + redundancy - st.base_T, emit_start, T_full);
+    const int nf = (int) (emit_end - emit_start);
+
+    audition_audio_f32 * mel_f32 = audition_audio_f32_init();
+    mel_f32->nx = nf;
+    mel_f32->ny = mel.n_mel;
+    mel_f32->buf.resize((size_t) nf * mel.n_mel);
+    for (int j = 0; j < mel.n_mel; j++) {
+        std::copy(mel.data.begin() + (size_t) j * mel.n_len + emit_start,
+                  mel.data.begin() + (size_t) j * mel.n_len + emit_end,
+                  mel_f32->buf.begin() + (size_t) j * nf);
+    }
+    // conv2 has stride 2: n context mel frames cover (n+1)/2 conv frames
+    mel_f32->trim_prefix = (int) (core_start - emit_start_g + 1) / 2;
+    mel_f32->trim_suffix = (redundancy + 1) / 2;
+
+    st.last_emitted_T = core_end;
+    st.n_chunks++;
+    *out_mel = mel_f32;
+
+    LOG_INF("%s: chunk %d frames=%d core=[%lld,%lld) buf=%lld base_T=%lld floor=%.2f trim=%d/%d\n",
+            __func__, st.n_chunks, nf, (long long) core_start, (long long) core_end, (long long) L,
+            (long long) st.base_T, floor_v, mel_f32->trim_prefix, mel_f32->trim_suffix);
     return true;
 }

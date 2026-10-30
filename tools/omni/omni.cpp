@@ -909,10 +909,16 @@ bool audition_read_binary_file(const char * fname, std::vector<uint8_t> * buf_re
     return true;
 }
 
-struct omni_embed * omni_audio_embed_make_with_bytes(audition_ctx * ctx_audio, int n_threads, audition_audio_u8 * audio) {
+struct omni_embed * omni_audio_embed_make_with_bytes(audition_ctx * ctx_audio, int n_threads, audition_audio_u8 * audio, bool streaming) {
     audition_audio_f32 * res_auds = audition_audio_f32_init();
     // printf("omni_audio_embed_make_with_bytes 1 :\n");
-    if (!audition_audio_preprocess(ctx_audio, audio, &res_auds)) {
+    audition_audio_f32 * res_init = res_auds;
+    const bool ok = streaming ? audition_audio_preprocess_stream(ctx_audio, audio, &res_auds)
+                              : audition_audio_preprocess(ctx_audio, audio, &res_auds);
+    if (res_auds != res_init) {
+        audition_audio_f32_free(res_init);
+    }
+    if (!ok) {
         LOG_ERR("%s: failed to preprocess audio file\n", __func__);
         audition_audio_f32_free(res_auds);
         return NULL;
@@ -945,7 +951,7 @@ struct omni_embed * omni_audio_embed_make_with_bytes(audition_ctx * ctx_audio, i
     return result;
 }
 
-struct omni_embed * omni_audio_embed_make_with_filename(struct audition_ctx * ctx_audio, int n_threads, std::string audio_path) {
+struct omni_embed * omni_audio_embed_make_with_filename(struct audition_ctx * ctx_audio, int n_threads, std::string audio_path, bool streaming) {
     audition_audio_u8 * audio = audition_audio_u8_init();
     // printf("omni_audio_embed_make_with_filename 1 :%s\n", audio_path.c_str());
     if (!audition_read_binary_file(audio_path.c_str(), &audio->buf)) {
@@ -953,7 +959,7 @@ struct omni_embed * omni_audio_embed_make_with_filename(struct audition_ctx * ct
         return NULL;
     }
     // printf("omni_audio_embed_make_with_filename 2 :%s\n", audio_path.c_str());
-    omni_embed *embed = omni_audio_embed_make_with_bytes(ctx_audio, n_threads, audio);
+    omni_embed *embed = omni_audio_embed_make_with_bytes(ctx_audio, n_threads, audio, streaming);
     if (embed == NULL) {
         LOG_ERR("%s: failed to preprocess audio file, %s\n", __func__, audio_path.c_str());
     }
@@ -9488,7 +9494,7 @@ static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * 
             if (!has_aud) return 0.0;
             auto t0 = std::chrono::high_resolution_clock::now();
             auto * audio_embeds = omni_audio_embed_make_with_filename(
-                ctx_omni->ctx_audio, params->cpuparams.n_threads, req->aud_fname);
+                ctx_omni->ctx_audio, params->cpuparams.n_threads, req->aud_fname, ctx_omni->duplex_mode);
             if (audio_embeds != nullptr && audio_embeds->n_pos > 0) {
                 packet->audio_embed.resize(audio_embeds->n_pos * hidden_size);
                 std::memcpy(packet->audio_embed.data(), audio_embeds->embed,
@@ -10635,6 +10641,9 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
             }
         }
         
+        // user audio starts a fresh streaming mel + whisper KV (the ref audio went through it above)
+        audition_audio_stream_reset(ctx_omni->ctx_audio);
+
         // 标记系统 prompt 已初始化
         ctx_omni->system_prompt_initialized = true;
 
@@ -10740,7 +10749,7 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
             }
             if (aud_fname.length() > 0) {
                 print_with_timestamp("stream_prefill(index=%d): processing user audio: %s\n", index, aud_fname.c_str());
-                auto * embeds = omni_audio_embed_make_with_filename(ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads, aud_fname);
+                auto * embeds = omni_audio_embed_make_with_filename(ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads, aud_fname, ctx_omni->duplex_mode);
                 // 🔧 [修复] 音频太短时会在 audition_audio_preprocess 中自动 pad 静音到 100ms
                 // 这里做安全检查，如果仍然失败则跳过该帧音频
                 if (embeds != nullptr && embeds->n_pos > 0) {
@@ -10784,7 +10793,7 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
             // 只有在音频路径非空时才处理音频
             if (aud_fname.length() > 0) {
                 LOG_INF("%s: aud_fname:%s\n", __func__, aud_fname.c_str());
-                auto * audio_embeds = omni_audio_embed_make_with_filename(ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads, aud_fname);
+                auto * audio_embeds = omni_audio_embed_make_with_filename(ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads, aud_fname, ctx_omni->duplex_mode);
                 // 🔧 [修复] 音频太短时会在 audition_audio_preprocess 中自动 pad 静音到 100ms
                 // 这里做安全检查，如果仍然失败则跳过该帧音频（保持 audio_embed 为空）
                 if (audio_embeds != nullptr && audio_embeds->n_pos > 0) {

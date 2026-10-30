@@ -114,6 +114,10 @@ struct audition_audio_f32 {
     int ny;
 
     std::vector<float> buf;
+
+    // whisper conv output frames to drop at each end (the mel carries extra CNN context frames)
+    int trim_prefix = 0;
+    int trim_suffix = 0;
 };
 
 void audition_audio_u8_free(struct audition_audio_u8 * audio);
@@ -170,6 +174,10 @@ struct audition_audio_f32   * audition_audio_f32_init(void);
 struct audition_audio_f32_batch * audition_audio_f32_batch_init(void);
 
 bool audition_audio_preprocess  (struct audition_ctx * ctx, struct audition_audio_u8 * audio, struct audition_audio_f32 ** out_mel);
+// duplex streaming mel, same as Python StreamingMelProcessorExact (1 s chunks, mel over the
+// accumulated buffer, 2 frames of CNN context each side); the first chunk after a reset clears the whisper KV
+bool audition_audio_preprocess_stream(struct audition_ctx * ctx, struct audition_audio_u8 * audio, struct audition_audio_f32 ** out_mel);
+void audition_audio_stream_reset(struct audition_ctx * ctx);
 bool audition_audio_encode      (struct audition_ctx * ctx, int n_threads, struct audition_audio_f32 * audio, float * vec);
 bool audition_audio_batch_encode(struct audition_ctx * ctx, int n_threads, const struct audition_audio_f32_batch * audios, float * vec);
 

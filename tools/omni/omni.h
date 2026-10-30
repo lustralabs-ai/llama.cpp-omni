@@ -443,6 +443,8 @@ struct omni_context {
     // C++ Token2Wav session for audio synthesis
     std::unique_ptr<omni::flow::Token2WavSession> token2wav_session;
     bool token2wav_initialized = false;
+    std::string t2w_default_prompt_cache;  // voice used when a session has no ref audio
+    std::string t2w_voice_key;             // "default" or hash of the ref audio the token2wav prompt came from
     std::string token2wav_model_dir;  // Directory containing token2wav GGUF models
     
     // 🔧 [Python Token2Wav] 使用 Python stepaudio2 库实现的 Token2Wav

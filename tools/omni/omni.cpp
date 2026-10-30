@@ -966,12 +966,25 @@ struct omni_embed * omni_audio_embed_make_with_filename(struct audition_ctx * ct
 //
 // omni llm eval
 //
+// Duplex KV window overrides. Every 1 s duplex step prefills ~80 tokens against the whole
+// context, so its cost grows with n_past; a smaller window bounds per-step latency.
+//   OMNI_DUPLEX_SLIDE_AT : slide once n_past reaches this (default n_ctx - 2048)
+//   OMNI_DUPLEX_KEEP     : tokens kept after a slide   (default max(n_ctx / 4, 2048))
+static int duplex_env_int(const char * name, int dflt) {
+    const char * e = std::getenv(name);
+    const int    v = (e && *e) ? std::atoi(e) : 0;
+    return v > 0 ? v : dflt;
+}
+
 static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* params, int chunk_size) {
     const int n_ctx = params->n_ctx;
 
     // ==================== 双工模式：按轮次边界智能清理 ====================
     if (ctx_omni->duplex_mode) {
-        const int duplex_trigger = std::max(ctx_omni->n_keep, n_ctx - 2048);
+        const int slide_at           = std::min(duplex_env_int("OMNI_DUPLEX_SLIDE_AT", n_ctx - 2048), n_ctx - 2048);
+        const int target_keep_tokens = std::min(duplex_env_int("OMNI_DUPLEX_KEEP", std::max(n_ctx / 4, 2048)),
+                                                std::max(slide_at / 2, 256));
+        const int duplex_trigger = std::max(ctx_omni->n_keep, slide_at);
 
         if (ctx_omni->n_past + chunk_size < duplex_trigger) {
             return;
@@ -1004,7 +1017,6 @@ static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* 
             // 原行为是丢掉 [n_keep, n_past)，模型立刻失忆 → 连续长对话下触发后模型会
             // 陷入长时间 LISTEN / 彻底失控（case 3、case 4）。
             // 改为按 tail window 保留最近 target_keep_tokens，通过左移 KV 对齐位置。
-            const int target_keep_tokens = std::max(n_ctx / 4, 2048);
             int keep_from = ctx_omni->n_past - target_keep_tokens;
             keep_from = std::max(keep_from, ctx_omni->n_keep);
             int n_discard = keep_from - ctx_omni->n_keep;
@@ -1033,7 +1045,6 @@ static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* 
             }
         } else {
             // 保留约 n_ctx/4 的上下文，按 round boundary 对齐截断
-            const int target_keep_tokens = std::max(n_ctx / 4, 2048);
             const int min_keep_from_pos  = ctx_omni->n_past - target_keep_tokens;
 
             int keep_from = rounds[total_rounds - 2];
@@ -4462,6 +4473,8 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             
             if (init_ok) {
                 ctx_omni->token2wav_initialized = true;
+                ctx_omni->t2w_default_prompt_cache = prompt_cache_gguf;
+                ctx_omni->t2w_voice_key = "default";
                 // Initialize token2wav buffer with 3 silence tokens (4218) as Python does
                 // Python: buffer = [4218] * 3  # 预先放入3个前缀静音token
                 ctx_omni->token2wav_buffer.clear();
@@ -10350,6 +10363,116 @@ static bool duplex_decode(omni_context * ctx_omni,
 // ===== END DUPLEX PIPELINE ==================================================
 // ============================================================================
 
+
+// ==================== per-session token2wav voice ====================
+// The C++ token2wav starts with the speaker prompt from prompt_cache.gguf. For a
+// session with ref audio, build a prompt bundle (s3 tokens, campplus speaker
+// embedding, 24 kHz mel) with tools/omni/pyt2w/make_prompt_bundle.py, cache it by
+// the wav's content hash, and restart the token2wav stream with it.
+//   OMNI_T2W_ASSET_DIR    dir with speech_tokenizer_v2_25hz.onnx + campplus.onnx (required to clone)
+//   OMNI_T2W_PYTHON       python interpreter (default python3)
+//   OMNI_T2W_VOICE_CACHE  bundle cache dir (default $XDG_CACHE_HOME or ~/.cache /llama-omni/voices)
+static std::string t2w_voice_cache_root() {
+    if (const char * d = getenv("OMNI_T2W_VOICE_CACHE"); d && *d) return d;
+    if (const char * d = getenv("XDG_CACHE_HOME"); d && *d) return std::string(d) + "/llama-omni/voices";
+    if (const char * d = getenv("HOME"); d && *d) return std::string(d) + "/.cache/llama-omni/voices";
+    return "/tmp/llama-omni-voices";
+}
+
+static std::string shell_quote(const std::string & s) {
+    std::string out = "'";
+    for (char c : s) {
+        if (c == '\'') out += "'\\''";
+        else out += c;
+    }
+    return out + "'";
+}
+
+static bool file_hash_hex(const std::string & path, std::string & out) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f.good()) return false;
+    uint64_t h = 1469598103934665603ULL;  // FNV-1a 64
+    char buf[65536];
+    while (f) {
+        f.read(buf, sizeof(buf));
+        for (std::streamsize i = 0; i < f.gcount(); ++i) {
+            h ^= (uint8_t) buf[i];
+            h *= 1099511628211ULL;
+        }
+    }
+    char hex[17];
+    snprintf(hex, sizeof(hex), "%016llx", (unsigned long long) h);
+    out = hex;
+    return true;
+}
+
+static bool t2w_build_voice_bundle(const std::string & wav, const std::string & dir) {
+    const char * assets = getenv("OMNI_T2W_ASSET_DIR");
+    if (!assets || !*assets) {
+        print_with_timestamp("Token2Wav voice: OMNI_T2W_ASSET_DIR not set, cannot clone ref audio voice\n");
+        return false;
+    }
+    const char * py = getenv("OMNI_T2W_PYTHON");
+    const std::string cmd = shell_quote(py && *py ? py : "python3") + " " +
+                            shell_quote("tools/omni/pyt2w/make_prompt_bundle.py") + " " + shell_quote(wav) + " " +
+                            shell_quote(dir) + " " + shell_quote(assets) + " 2>&1";
+    print_with_timestamp("Token2Wav voice: building prompt bundle: %s\n", cmd.c_str());
+    FILE * p = popen(cmd.c_str(), "r");
+    if (!p) return false;
+    char line[512];
+    while (fgets(line, sizeof(line), p)) {
+        print_with_timestamp("Token2Wav voice: %s", line);
+    }
+    return pclose(p) == 0;
+}
+
+// Must run while the T2W thread is stopped (stream_prefill index 0, before it starts).
+static void t2w_apply_voice(struct omni_context * ctx_omni, const std::string & wav) {
+    if (!ctx_omni->token2wav_initialized || !ctx_omni->token2wav_session || ctx_omni->use_python_token2wav) {
+        return;
+    }
+    if (ctx_omni->t2w_thread.joinable()) {
+        print_with_timestamp("Token2Wav voice: T2W thread running, keeping current voice\n");
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    std::string key = "default";
+    if (!wav.empty() && !file_hash_hex(wav, key)) {
+        print_with_timestamp("Token2Wav voice: cannot read %s\n", wav.c_str());
+        key = "default";
+    }
+    if (key == ctx_omni->t2w_voice_key) {
+        return;
+    }
+
+    bool ok = false;
+    if (key != "default") {
+        const std::string dir = t2w_voice_cache_root() + "/" + key;
+        std::ifstream probe(dir + "/prompt_mel_btc_f32.bin");
+        if (probe.good() || (cross_platform_mkdir_p(t2w_voice_cache_root()) && t2w_build_voice_bundle(wav, dir))) {
+            ok = ctx_omni->token2wav_session->set_prompt_bundle(dir, 5, 1.0f);
+        }
+        if (!ok) {
+            print_with_timestamp("Token2Wav voice: failed to use ref audio voice, falling back to default\n");
+            key = "default";
+        }
+    }
+    if (!ok && key == "default" && ctx_omni->t2w_voice_key != "default") {
+        ok = !ctx_omni->t2w_default_prompt_cache.empty() &&
+             ctx_omni->token2wav_session->set_prompt_cache_gguf(ctx_omni->t2w_default_prompt_cache, 5, 1.0f);
+        if (!ok) {
+            print_with_timestamp("Token2Wav voice: failed to restore default voice\n");
+        }
+    }
+    if (ok) {
+        ctx_omni->t2w_voice_key = key;
+        ctx_omni->token2wav_buffer = {4218, 4218, 4218};
+        ctx_omni->token2wav_wav_idx = 0;
+    }
+    print_with_timestamp("Token2Wav voice: %s (%.0f ms)\n", ctx_omni->t2w_voice_key.c_str(),
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+}
+
 bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::string img_fname, int index, int max_slice_nums, std::string text) {
 
     // 🔧 [Duplex Pipeline Stage 1] 路由：
@@ -10447,6 +10570,7 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
     // 然后测试脚本又会调用 stream_prefill(audio_0, "", 0)
     // 如果不检查这个标志，系统 prompt 会被评估两次，导致格式混乱
     if (index == 0 && !ctx_omni->system_prompt_initialized) {
+        t2w_apply_voice(ctx_omni, aud_fname);
         print_with_timestamp("stream_prefill: n_past = %d\n voice_clone_prompt = %s\n assistant_prompt = %s\n", ctx_omni->n_past, voice_clone_prompt.c_str(), assistant_prompt.c_str());
         // tc-todo
         // llama_kv_cache_clear(ctx_omni->ctx_llama);

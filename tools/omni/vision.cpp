@@ -1027,7 +1027,24 @@ private:
 
         ggml_tensor * cur;
 
-        // TODO @ngxson : support flash attention
+        // flash attention avoids the F32 KQ matmul + softmax over n_tokens^2 (~2/3 of SigLIP time on gfx1151);
+        // VISION_FLASH_ATTN=0 restores the original path
+        static const bool use_fa = !getenv("VISION_FLASH_ATTN") || atoi(getenv("VISION_FLASH_ATTN"));
+        if (use_fa && kq_mask == nullptr) {
+            const auto n_tokens = q->ne[1];
+            const auto n_head   = q->ne[2];
+            const auto n_batch  = q->ne[3];
+            ggml_tensor * vf = ggml_permute(ctx0, v_cur, 0, 2, 1, 3);
+            k  = ggml_cast(ctx0, k,  GGML_TYPE_F16);
+            vf = ggml_cast(ctx0, vf, GGML_TYPE_F16);
+            cur = ggml_flash_attn_ext(ctx0, q, k, vf, nullptr, kq_scale, 0.0f, 0.0f);
+            ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+            // result: [d_head, n_head, n_tokens, n_batch]
+            cur = ggml_reshape_3d(ctx0, cur, cur->ne[0]*n_head, n_tokens, n_batch);
+            if (n_batch == 1) {
+                cur = ggml_reshape_2d(ctx0, cur, cur->ne[0], n_tokens);
+            }
+        } else
         {
             const auto n_tokens = q->ne[1];
             const auto n_head   = q->ne[2];

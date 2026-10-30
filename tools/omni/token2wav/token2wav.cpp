@@ -63,6 +63,22 @@ bool Token2WavSession::init_from_prompt_bundle(const std::string & encoder_gguf,
     return true;
 }
 
+bool Token2WavSession::set_prompt_cache_gguf(const std::string & prompt_cache_gguf_path,
+                                             int                 n_timesteps,
+                                             float               temperature) {
+    pending_.clear();
+    return t2w.start_stream_with_prompt_cache_gguf(prompt_cache_gguf_path, n_timesteps, temperature);
+}
+
+bool Token2WavSession::set_prompt_bundle(const std::string & prompt_bundle_dir, int n_timesteps, float temperature) {
+    pending_.clear();
+    Token2Mel::PromptBundle pb;
+    if (!Token2Mel::load_prompt_bundle_dir(prompt_bundle_dir, pb)) {
+        return false;
+    }
+    return t2w.start_stream_with_prompt(pb, n_timesteps, temperature);
+}
+
 bool Token2WavSession::feed_window(const int32_t *      tokens,
                                    int64_t              n_tokens,
                                    bool                 is_final,

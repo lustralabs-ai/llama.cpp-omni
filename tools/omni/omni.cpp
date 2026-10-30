@@ -5959,6 +5959,24 @@ static bool generate_audio_tokens_local(
     // Python generate_chunk samples up to max_new_token but returns new_tokens[:, 0:t]: the last
     // sample is never fed to the KV cache nor vocoded, so a full duplex chunk is 25 tokens (1.00 s).
     const int max_loop_tokens = ctx_omni->duplex_mode ? max_audio_tokens - 1 : max_audio_tokens;
+
+    // Duplex turn-end flush (no new text, text_eos, up to 155 codes): once the sentence is spoken the
+    // Talker can start inventing a continuation (even re-speaking the last phrase) that EOS or the cap
+    // then cuts mid-word. As vllm-omni does (_TURN_END_QUIET_STOP_FRAMES), stop after 8 quiet codes in
+    // a row once there was speech, and drop a short fragment that follows a pause at the very end.
+    static const int TURN_END_QUIET_CODES[] = {
+        735, 1458, 1461, 1464, 1488, 1539, 1701, 1704, 1707, 1716, 1731, 1944,
+        1947, 1950, 2031, 2112, 3648, 3651, 3891, 3894, 3895, 3903, 3972, 3975,
+        4134, 4137, 4138, 4146, 4218, 4299, 5900, 6082, 6324, 6405, 6486,
+    };
+    const int TURN_END_QUIET_STOP = 8;     // quiet codes in a row that end the flush
+    const int TURN_END_PAUSE = 3;          // quiet codes in a row that count as a pause
+    const int TURN_END_MAX_FRAGMENT = 6;   // codes after a final pause that are dropped (<= 240 ms)
+    const bool drain_turn_end = ctx_omni->duplex_mode && is_end_of_turn;
+    bool   drain_spoke     = false;
+    int    drain_quiet_run = 0;
+    size_t drain_frag_start = SIZE_MAX;    // index in output_audio_tokens of speech after the last pause
+
     for (int t = 0; t < max_loop_tokens; ++t) {
         // 🔧 [差异1修复] 计算 force_no_eos
         // Python generate_chunk: if force_no_stop or t < min_new_tokens: logits[:, eos_token] = -torch.inf
@@ -6015,6 +6033,25 @@ static bool generate_audio_tokens_local(
             ctx_omni->tts_all_generated_tokens.pop_back();
             // 不 break，继续执行后续逻辑（包括可能的流式推送剩余 tokens）
         }
+
+        bool drain_stop = false;
+        if (drain_turn_end && !is_eos) {
+            const bool quiet = std::find(std::begin(TURN_END_QUIET_CODES), std::end(TURN_END_QUIET_CODES),
+                                         relative_idx) != std::end(TURN_END_QUIET_CODES);
+            if (quiet) {
+                drain_quiet_run++;
+            } else {
+                if (drain_spoke && drain_quiet_run >= TURN_END_PAUSE) {
+                    drain_frag_start = output_audio_tokens.size() - 1;
+                }
+                drain_spoke     = true;
+                drain_quiet_run = 0;
+            }
+            if (drain_spoke && drain_quiet_run >= TURN_END_QUIET_STOP) {
+                drain_stop       = true;
+                drain_frag_start = SIZE_MAX;
+            }
+        }
         
         // 🔧 [与 Python 流式双工对齐] 流式推送，但保留 lookahead
         // Python _generate_waveform_from_tokens 逻辑：
@@ -6049,8 +6086,20 @@ static bool generate_audio_tokens_local(
         }
         
         // 如果是 EOS，在完成上述处理后退出循环
-        if (is_eos) {
+        if (is_eos || drain_stop) {
+            if (drain_stop) {
+                print_with_timestamp("TTS Local: turn-end flush stopped after %d quiet codes (%zu codes)\n",
+                                     drain_quiet_run, output_audio_tokens.size());
+            }
             break;
+        }
+    }
+    if (drain_turn_end && drain_frag_start != SIZE_MAX && drain_quiet_run == 0) {
+        const size_t frag_len = output_audio_tokens.size() - drain_frag_start;
+        if (frag_len <= (size_t)TURN_END_MAX_FRAGMENT && frag_len <= stream_buffer.size()) {
+            output_audio_tokens.resize(output_audio_tokens.size() - frag_len);
+            stream_buffer.resize(stream_buffer.size() - frag_len);
+            print_with_timestamp("TTS Local: turn-end flush dropped a %zu-code fragment after a pause\n", frag_len);
         }
     }
     // 问题：如果只推送 25 tokens，T2W buffer 从 3->28，处理后剩余 3 个 tokens

@@ -990,13 +990,17 @@ static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* 
             return;
         }
 
-        // defer：生成中 / TTS 忙 / 正在 SPEAK 时不滑窗，除非快要撞上 n_ctx 硬限制
-        bool generating    = ctx_omni->text_streaming;
-        bool tts_busy      = !ctx_omni->speek_done;
+        // Defer while the model is speaking, unless n_ctx is about to overflow.
+        // text_streaming/speek_done used to gate this too, but stream_decode sets
+        // text_streaming before the LLM thread prefills, so the gate never opened and
+        // the only slide was the FORCE one at n_ctx - 512, wherever it landed. Sliding
+        // the LLM KV is safe at any point on the LLM thread (n_past is updated in place).
+        // The TTS KV is left alone: it doesn't depend on LLM positions, the TTS thread
+        // resets it at each new SPEAK turn, and clearing it from here raced that thread.
         bool mid_speak     = !ctx_omni->slide_last_was_listen.load();
         bool force_slide   = (ctx_omni->n_past + chunk_size >= n_ctx - 512);
 
-        if (!force_slide && (generating || tts_busy || mid_speak)) {
+        if (!force_slide && mid_speak) {
             return;
         }
         if (force_slide) {
@@ -1033,14 +1037,7 @@ static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* 
                 ctx_omni->n_past -= n_discard;
                 // 没有可信的 round boundary 了，清空以避免后续按错位的 boundary 切割
                 ctx_omni->round_start_positions.clear();
-                if (ctx_omni->ctx_tts_llama) {
-                    llama_memory_t tts_mem = llama_get_memory(ctx_omni->ctx_tts_llama);
-                    if (tts_mem) llama_memory_seq_rm(tts_mem, 0, 0, -1);
-                    ctx_omni->tts_n_past_accumulated = 0;
-                    ctx_omni->tts_all_generated_tokens.clear();
-                    ctx_omni->tts_condition_saved = false;
-                }
-                print_with_timestamp("⚠️ slide DONE: rounds<2 tail-keep: n_past %d→%d, freed %d (kept last %d), TTS KV cleared\n",
+                print_with_timestamp("⚠️ slide DONE: rounds<2 tail-keep: n_past %d→%d, freed %d (kept last %d)\n",
                                      old_n_past, ctx_omni->n_past, n_discard, target_keep_tokens);
             }
         } else {
@@ -1077,15 +1074,7 @@ static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* 
                 }
                 ctx_omni->round_start_positions = new_rounds;
 
-                if (ctx_omni->ctx_tts_llama) {
-                    llama_memory_t tts_mem = llama_get_memory(ctx_omni->ctx_tts_llama);
-                    if (tts_mem) llama_memory_seq_rm(tts_mem, 0, 0, -1);
-                    ctx_omni->tts_n_past_accumulated = 0;
-                    ctx_omni->tts_all_generated_tokens.clear();
-                    ctx_omni->tts_condition_saved = false;
-                }
-
-                print_with_timestamp("⚠️ slide DONE: n_past %d→%d, freed %d, boundaries_kept=%d, TTS KV cleared\n",
+                print_with_timestamp("⚠️ slide DONE: n_past %d→%d, freed %d, boundaries_kept=%d\n",
                                      old_n_past, ctx_omni->n_past, n_discard, (int)new_rounds.size());
             }
         }

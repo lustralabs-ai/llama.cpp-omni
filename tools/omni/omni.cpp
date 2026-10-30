@@ -5873,8 +5873,12 @@ static bool generate_audio_tokens_local(
     //   if end_of_turn: min_token_per_chunk = 0
     // - 单工模式: 设置最小 100 个 tokens，防止 TTS 过早生成 EOS
     //   10 个中文字约需要 100-150 个 audio tokens (每字 10-15 tokens)
+    // Python also drops the minimum on the first chunk of a turn (tts_text_start_pos == 0) so a
+    // short opener like "Sure." is not stretched to a full second. Keep 1 rather than 0: a
+    // chunk that ends with no tokens would make the next chunk re-forward (and drop) this text.
+    const bool turn_start = ctx_omni->tts_all_generated_tokens.empty();
     const int min_new_tokens = ctx_omni->duplex_mode ? 
-        (is_end_of_turn ? 0 : 26) : 
+        (is_end_of_turn ? 0 : (turn_start ? 1 : 26)) : 
         100;  // 🔧 单工模式：至少生成 100 个 tokens 防止过早 EOS
     
     // 🚀 流水线优化：Token2Wav需要28个tokens (25+3 lookahead)才能输出音频
@@ -5884,7 +5888,10 @@ static bool generate_audio_tokens_local(
     bool first_chunk_pushed = false;
     std::vector<int32_t> stream_buffer;
     
-    for (int t = 0; t < max_audio_tokens; ++t) {
+    // Python generate_chunk samples up to max_new_token but returns new_tokens[:, 0:t]: the last
+    // sample is never fed to the KV cache nor vocoded, so a full duplex chunk is 25 tokens (1.00 s).
+    const int max_loop_tokens = ctx_omni->duplex_mode ? max_audio_tokens - 1 : max_audio_tokens;
+    for (int t = 0; t < max_loop_tokens; ++t) {
         // 🔧 [差异1修复] 计算 force_no_eos
         // Python generate_chunk: if force_no_stop or t < min_new_tokens: logits[:, eos_token] = -torch.inf
         // 如果还没达到 min_new_tokens，阻止 EOS 被采样（在采样前设置 EOS logit 为 -inf）
@@ -6654,13 +6661,8 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                             merged_embeddings[i] = llm_embeds[i] + projected_hidden[i];
                         }
                         
-                        // Add audio_bos_embed
-                        std::vector<float> audio_bos_embed(tts_n_embd, 0.0f);
-                        if (tts_emb_text(ctx_omni, audio_bos_token_id, audio_bos_embed.data(), tts_n_embd)) {
-                            merged_embeddings.insert(merged_embeddings.end(), audio_bos_embed.begin(), audio_bos_embed.end());
-                            n_tokens_filtered += 1;
-                        }
-                        
+                        // audio_bos is appended by generate_audio_tokens_local; adding it here
+                        // too gave the TTS [text, bos, bos] per chunk instead of Python's [text, bos].
                         merged_success = true;
                     }
                 }

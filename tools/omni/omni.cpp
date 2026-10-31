@@ -5992,6 +5992,10 @@ static bool generate_audio_tokens_local(
     // sentences), the flush still owes words and a comma pause is 8+ quiet codes, so the stop cut
     // the rest of the sentence. A caught-up Talker idles at the end of its last 1 s chunk, a lagging
     // one is still speaking there; a lagging flush only stops on a much longer silence.
+    // The Talker also samples EOS just after every 25-code cadence point whether or not its text is
+    // spoken, which cut the last word of a turn. As vllm-omni does for such flushes
+    // (_turn_end_boundary_eos_masked), EOS is held for 5 steps after each cadence point. Holding it
+    // until silence (vllm's other mode) made the Talker babble on past the sentence here.
     static const int TURN_END_QUIET_CODES[] = {
         735, 1458, 1461, 1464, 1488, 1539, 1701, 1704, 1707, 1716, 1731, 1944,
         1947, 1950, 2031, 2112, 3648, 3651, 3891, 3894, 3895, 3903, 3972, 3975,
@@ -6002,6 +6006,8 @@ static bool generate_audio_tokens_local(
     const int TURN_END_MAX_FRAGMENT = 6;   // codes after a final pause that are dropped (<= 240 ms)
     const int TURN_END_CAUGHT_UP = 12;     // quiet codes ending the previous chunk that mean caught up
     const int TURN_END_LAG_QUIET_STOP = 20; // quiet codes in a row that end a lagging flush (800 ms)
+    const int TURN_END_CADENCE = 25;       // codes per Talker chunk
+    const int TURN_END_CADENCE_HOLD = 5;   // steps after each cadence point on which EOS is held
     auto is_quiet_code = [&](int code) {
         return std::find(std::begin(TURN_END_QUIET_CODES), std::end(TURN_END_QUIET_CODES), code)
                != std::end(TURN_END_QUIET_CODES);
@@ -6025,7 +6031,8 @@ static bool generate_audio_tokens_local(
         // 🔧 [差异1修复] 计算 force_no_eos
         // Python generate_chunk: if force_no_stop or t < min_new_tokens: logits[:, eos_token] = -torch.inf
         // 如果还没达到 min_new_tokens，阻止 EOS 被采样（在采样前设置 EOS logit 为 -inf）
-        bool force_no_eos = (t < min_new_tokens);
+        bool force_no_eos = (t < min_new_tokens) ||
+            (drain_turn_end && t >= TURN_END_CADENCE && t % TURN_END_CADENCE < TURN_END_CADENCE_HOLD);
         
         // Sample next token
         // 🔧 [差异2&3修复] 传入：

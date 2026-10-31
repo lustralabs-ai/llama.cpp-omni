@@ -8,6 +8,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cinttypes>
 #include <fstream>
 #include <sstream>
@@ -160,6 +161,27 @@ struct omni_logger_state {
 
 extern struct omni_logger_state g_logger_state;
 
+// True when env var `name` is set to anything other than "" or "0".
+static inline bool omni_env_flag(const char * name) {
+    const char * v = getenv(name);
+    return v && *v && strcmp(v, "0") != 0;
+}
+
+// OMNI_LOG_VERBOSE=1: print per-step INFO logs and print_with_timestamp() lines.
+// Off by default; warnings, errors and print_with_timestamp_always() lines still print.
+static inline bool omni_log_verbose() {
+    static const bool on = omni_env_flag("OMNI_LOG_VERBOSE");
+    return on;
+}
+
+// OMNI_DEBUG_DUMP=1: write the debug dumps under base_output_dir (llm_debug/, tts_txt/,
+// tts_wav/wav_N.wav, token files, merged wavs). Off by default; audio still reaches the
+// client through audio_output_cb.
+static inline bool omni_debug_dump() {
+    static const bool on = omni_env_flag("OMNI_DEBUG_DUMP");
+    return on;
+}
+
 static void omni_log_internal_v(enum ggml_log_level level, const char * format, va_list args) {
     if (format == NULL) {
         return;
@@ -189,7 +211,8 @@ static void omni_log_internal(enum ggml_log_level level, const char * format, ..
 
 #define LOG_TMPL(level, ...) \
     do { \
-        if ((level) >= g_logger_state.verbosity_thold) { \
+        if ((level) >= g_logger_state.verbosity_thold && \
+            ((level) >= GGML_LOG_LEVEL_WARN || omni_log_verbose())) { \
             omni_log_internal((level), __VA_ARGS__); \
         } \
     } while (0)

@@ -625,6 +625,14 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
     int msg_counter = 0;
     std::vector<std::string> retained_media_files;
 
+    // Per-session dir under temp_dir: step media and (with OMNI_DEBUG_DUMP=1) debug dumps.
+    // Removed at session end unless dumps are on.
+    auto remove_session_dir = [&](const std::string & session_id) {
+        if (session_id.empty() || omni_debug_dump_enabled()) return;
+        std::error_code ec;
+        fs::remove_all(fs::path(temp_dir) / session_id, ec);
+    };
+
     // Helper: fail-fast — send session.closed and close WS
     auto fail_fast = [&](const std::string & session_id, const std::string & reason) {
         if (!session_id.empty()) {
@@ -636,6 +644,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             fs::remove(path);
         }
         retained_media_files.clear();
+        remove_session_dir(session_id);
         ws.close();
     };
 
@@ -693,13 +702,14 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
         fail_fast(session_id, "omni_init_failed");
         return;
     }
+    octx->remove_media_after_encode = !omni_debug_dump_enabled();
 
     // Full-duplex requires index=0 prefill before the first frame. This
     // initializes the system prompt and starts the duplex encoder/LLM pipeline.
     if (parsed_init.mode == "full_duplex" || !parsed_init.ref_audio_b64.empty()) {
         std::string voice_wav;
         if (!parsed_init.ref_audio_b64.empty()) {
-            voice_wav = TempMediaFiles::write_audio_wav(parsed_init.ref_audio_b64, temp_dir, msg_counter++);
+            voice_wav = TempMediaFiles::write_audio_wav(parsed_init.ref_audio_b64, session_output_dir, msg_counter++);
         }
         if (!parsed_init.ref_audio_b64.empty() && voice_wav.empty()) {
             fail_fast(session_id, "voice_audio_decode_failed");
@@ -834,7 +844,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             }
             std::string voice_wav;
             if (!parsed_init.ref_audio_b64.empty()) {
-                voice_wav = TempMediaFiles::write_audio_wav(parsed_init.ref_audio_b64, temp_dir, msg_counter++);
+                voice_wav = TempMediaFiles::write_audio_wav(parsed_init.ref_audio_b64, session_output_dir, msg_counter++);
             }
             const auto t_reset_start = std::chrono::steady_clock::now();
             bool ok = false;
@@ -914,7 +924,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             if (last_user_msg) {
                 int input_index = ++msg_counter;
                 for (const auto & img_b64 : last_user_msg->image_b64s) {
-                    std::string ipath = TempMediaFiles::write_image_jpeg(img_b64, temp_dir, input_index);
+                    std::string ipath = TempMediaFiles::write_image_jpeg(img_b64, session_output_dir, input_index);
                     if (!ipath.empty()) {
                         tmp_files.image_path = ipath; // last image wins
                     }
@@ -922,14 +932,14 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                 // Audio: use the first audio from the last user message
                 if (!last_user_msg->audio_b64s.empty()) {
                     tmp_files.audio_path = TempMediaFiles::write_audio_wav(
-                        last_user_msg->audio_b64s[0], temp_dir, input_index);
+                        last_user_msg->audio_b64s[0], session_output_dir, input_index);
                 }
                 for (size_t i = 0; i < last_user_msg->video_b64s.size(); ++i) {
                     const int stack_frames = i < last_user_msg->video_stack_frames.size()
                                            ? last_user_msg->video_stack_frames[i]
                                            : 1;
                     ExtractedVideoMedia video = extract_video_mp4_media(
-                        last_user_msg->video_b64s[i], temp_dir, ++msg_counter, stack_frames);
+                        last_user_msg->video_b64s[i], session_output_dir, ++msg_counter, stack_frames);
                     if (!video.video_path.empty()) {
                         turn_temp_paths.push_back(video.video_path);
                     }
@@ -1170,13 +1180,13 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             // Write audio to temp WAV
             if (!parsed_input.audio_b64.empty()) {
                 tmp_files.audio_path = TempMediaFiles::write_audio_wav(
-                    parsed_input.audio_b64, temp_dir, input_index);
+                    parsed_input.audio_b64, session_output_dir, input_index);
             }
 
             // Write first video frame to temp image
             if (!parsed_input.video_frames_b64.empty()) {
                 tmp_files.image_path = TempMediaFiles::write_image_jpeg(
-                    parsed_input.video_frames_b64[0], temp_dir, input_index);
+                    parsed_input.video_frames_b64[0], session_output_dir, input_index);
             }
 
             // Prefill
@@ -1353,6 +1363,7 @@ cleanup:
         fs::remove(path);
     }
     retained_media_files.clear();
+    remove_session_dir(session_id);
 
     ws.close();
 }

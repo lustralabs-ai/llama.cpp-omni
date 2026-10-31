@@ -66,8 +66,13 @@ build/bin/llama-omni-server --list-devices    # should list ROCm0
 ## Runtime settings (set by omni.sh, not CMake)
 
 - `GGML_CUDA_DISABLE_GRAPHS=1` turns off HIP graphs at runtime. The build keeps graphs compiled in, but the duplex graph shapes change every turn. That forces a recapture each turn, which stalls token2wav for 2–3 s.
+- `ROCBLAS_USE_HIPBLASLT=1` sends rocBLAS GEMMs through hipBLASLt. Token2wav goes from 168 to 140 ms per 1 s of audio, and the vision encoder gains about 5 ms per frame. The Q8_0 LLM is unaffected because it uses ggml's own kernels. In the 10-turn video e2e at 1 frame/s (120 W mode), underruns of 0.3 s or more went from 4–12 per run to 0–1.
 - `MTMD_BACKEND_DEVICE=ROCm0` runs the vision and audio encoders on the GPU.
 - `OMNI_T2W_ASSET_DIR` and `OMNI_T2W_PYTHON` are needed for ref-audio voice cloning. The voice prompt bundles are cached in `~/.cache/llama-omni/voices`.
+
+These two are optional, and omni.sh passes them through from your shell:
+- `OMNI_LOG_VERBOSE=1` turns on the per-step trace: `[prof]` lines, encoder and TTS chunk lines, and per-window T2W lines. Without it, the log keeps only session lifecycle, init, KV slides, first-audio latency, warnings and errors.
+- `OMNI_DEBUG_DUMP=1` keeps the debug dumps under `/tmp/omni_ws/<session_id>/`: `llm_debug/`, `tts_txt/` and `tts_wav/`. Without it, nothing is dumped, step inputs are deleted once encoded, and the session directory is removed when the session ends.
 
 ## Notes
 

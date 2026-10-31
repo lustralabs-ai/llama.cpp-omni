@@ -361,6 +361,10 @@ struct omni_context {
     
     // 🔧 [多实例支持] 可配置的输出目录，避免多个服务实例冲突
     std::string base_output_dir = "./tools/omni/output";
+
+    // stream_prefill() deletes its aud/img input files once they are encoded (the
+    // duplex encoder reads them asynchronously, so the caller can't do it).
+    bool remove_media_after_encode = false;
     
     // 每次会话，是否清除 kv cache（默认开启自动清理 kv cache）
     bool clean_kvcache = true;
@@ -515,6 +519,9 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                                 const std::string & base_output_dir = "./tools/omni/output");
 
 void omni_free(struct omni_context * ctx_omni);
+
+// OMNI_DEBUG_DUMP=1: keep debug dumps (llm_debug/, tts_txt/, tts_wav/) under base_output_dir.
+bool omni_debug_dump_enabled();
 // Stop/join inference threads and clear queues so the same context can serve a
 // new session, without tearing down the loaded model (unlike omni_free).
 void omni_prepare_for_reuse(struct omni_context * ctx_omni);

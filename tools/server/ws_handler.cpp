@@ -624,6 +624,10 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
     fs::create_directories(temp_dir);
     int msg_counter = 0;
     std::vector<std::string> retained_media_files;
+    // Duplex text is decoded one step per input.append, and a multi-byte char
+    // (the app's emoji markers) can straddle two steps, so the incomplete tail
+    // carries over to the next step instead of being flushed as U+FFFD.
+    std::string duplex_utf8_pending;
 
     // Per-session dir under temp_dir: step media and (with OMNI_DEBUG_DUMP=1) debug dumps.
     // Removed at session end unless dumps are on.
@@ -830,6 +834,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             // Same-session context reset (duplex): clear the LLM KV and re-prefill
             // the system prompt (optionally replaced) + ref audio. The read loop is
             // only here between steps, so no decode is in flight.
+            duplex_utf8_pending.clear();
             if (parsed_init.mode != "full_duplex") {
                 fail_fast(session_id, "reset_unsupported_mode");
                 return;
@@ -1236,7 +1241,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
 
             // Collect full text for response.done
             std::string full_text;
-            std::string utf8_pending;
+            std::string & utf8_pending = duplex_utf8_pending;
 
             // Poll text_queue
             while (true) {
@@ -1300,7 +1305,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             }
             double generate_ms = elapsed_ms(t_generate_start);
             {
-                const std::string text = sanitize_utf8_stream(utf8_pending, "", true);
+                const std::string text = sanitize_utf8_stream(utf8_pending, "");
                 if (!text.empty()) {
                     full_text += text;
                     send_event(make_text_delta(

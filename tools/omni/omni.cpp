@@ -10076,6 +10076,147 @@ static void duplex_do_prefill_one(omni_context * ctx_omni, common_params * param
 // 因为新路径下 ctx_llama 已由 llm 线程独占。
 // 返回 false 表示内部异常或被 break 打断。
 // ---------------------------------------------------------------------------
+static bool duplex_finish_decode(omni_context * ctx_omni, int decode_start_cache_len, int n_past_dec_0,
+                                 std::chrono::high_resolution_clock::time_point t_dec_begin);
+
+// ---------------------------------------------------------------------------
+// Forced speech (session.say). See docs/omni-duplex-say.md.
+//
+// A duplex speaking unit, as the model writes it, is
+//     <|speak|> text... [<|turn_eos|>] <|chunk_eos|> </unit>
+// and the TTS is fed each text token with the LLM hidden state taken right after that token was
+// evaluated. eval_tokens_with_hidden yields exactly those pairs, so forcing the tokens leaves
+// the KV cache and the TTS input the same as if the model had sampled the words itself.
+// ---------------------------------------------------------------------------
+
+void omni_duplex_say_clear(struct omni_context * ctx_omni) {
+    if (!ctx_omni) return;
+    std::lock_guard<std::mutex> lk(ctx_omni->duplex_say_mtx);
+    ctx_omni->duplex_say_tokens.clear();
+    ctx_omni->duplex_say_mute_after = false;
+    ctx_omni->duplex_muted          = false;
+    ctx_omni->duplex_say_finished   = false;
+}
+
+int omni_duplex_say(struct omni_context * ctx_omni, const std::string & text,
+                    int chars_per_step, bool mute_after) {
+    if (!ctx_omni || !ctx_omni->duplex_mode || !ctx_omni->ctx_llama) return 0;
+    // parse_special=false: client text can never inject control tokens.
+    std::vector<llama_token> toks = common_tokenize(ctx_omni->ctx_llama, text, false, false);
+    std::lock_guard<std::mutex> lk(ctx_omni->duplex_say_mtx);
+    ctx_omni->duplex_say_tokens.assign(toks.begin(), toks.end());
+    ctx_omni->duplex_say_chars_per_step = chars_per_step > 0 ? chars_per_step : 12;
+    ctx_omni->duplex_say_mute_after     = mute_after;
+    ctx_omni->duplex_muted              = false;
+    ctx_omni->duplex_say_finished       = false;
+    print_with_timestamp("Duplex say: queued %zu tokens, %d chars/step, mute_after=%d: %s\n",
+                         toks.size(), ctx_omni->duplex_say_chars_per_step, (int)mute_after, text.c_str());
+    return (int)toks.size();
+}
+
+// Take the next unit's worth of tokens: about chars_per_step characters, never splitting a word
+// (a token that does not start with a space continues the previous word). *last is set when the
+// queue is empty afterwards.
+static std::vector<llama_token> duplex_say_take_unit(omni_context * ctx_omni, bool * last) {
+    std::lock_guard<std::mutex> lk(ctx_omni->duplex_say_mtx);
+    auto & q = ctx_omni->duplex_say_tokens;
+    const int budget   = ctx_omni->duplex_say_chars_per_step;
+    const int hard_max = budget * 2;
+    std::vector<llama_token> out;
+    int n_chars = 0;
+    while (!q.empty()) {
+        const std::string piece = common_token_to_piece(ctx_omni->ctx_llama, q.front());
+        const bool starts_word = piece.empty() || piece[0] == ' ';
+        if (!out.empty() && n_chars + (int)piece.size() > budget && (starts_word || n_chars >= hard_max)) {
+            break;
+        }
+        out.push_back(q.front());
+        q.pop_front();
+        n_chars += (int)piece.size();
+    }
+    *last = q.empty();
+    return out;
+}
+
+// One forced speaking unit in place of sampling. Mirrors the bookkeeping of the sampled path.
+static void duplex_do_forced_speak(omni_context * ctx_omni, common_params * params,
+                                   const std::string & debug_dir) {
+    bool last = false;
+    const std::vector<llama_token> text_toks = duplex_say_take_unit(ctx_omni, &last);
+    const int n_embd = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
+
+    std::vector<llama_token> seq;
+    if (ctx_omni->special_token_speak >= 0) seq.push_back(ctx_omni->special_token_speak);
+    seq.insert(seq.end(), text_toks.begin(), text_toks.end());
+    if (last && ctx_omni->special_token_turn_eos >= 0) seq.push_back(ctx_omni->special_token_turn_eos);
+
+    float * hidden = nullptr;
+    if (!eval_tokens_with_hidden(ctx_omni, params, seq, params->n_batch, &ctx_omni->n_past, hidden)) {
+        LOG_ERR("Duplex say: eval failed, dropping the rest of the text\n");
+        omni_duplex_say_clear(ctx_omni);
+        last = true;
+    }
+
+    std::string response;
+    std::vector<llama_token> tts_ids;
+    std::vector<float>       tts_hidden;
+    for (size_t i = 0; i < seq.size(); ++i) {
+        const llama_token t = seq[i];
+        common_sampler_accept(ctx_omni->ctx_sampler, t, true);
+        if (get_token_type(ctx_omni, t) != OmniTokenType::NORMAL) continue;
+        ctx_omni->duplex_generated_tokens.push_back(t);
+        response += common_token_to_piece(ctx_omni->ctx_llama, t);
+        if (hidden && is_valid_tts_token(t)) {
+            tts_ids.push_back(t);
+            tts_hidden.insert(tts_hidden.end(), hidden + i * n_embd, hidden + (i + 1) * n_embd);
+        }
+    }
+    free(hidden);
+
+    for (llama_token t : {ctx_omni->special_token_chunk_eos, ctx_omni->special_token_unit_end}) {
+        if (t < 0) continue;
+        std::vector<llama_token> one = {t};
+        eval_tokens(ctx_omni, params, one, params->n_batch, &ctx_omni->n_past);
+    }
+
+    ctx_omni->ended_with_listen     = false;
+    ctx_omni->slide_last_was_listen = false;
+    if (last) {
+        ctx_omni->current_turn_ended = true;
+        std::lock_guard<std::mutex> lk(ctx_omni->duplex_say_mtx);
+        ctx_omni->duplex_muted        = ctx_omni->duplex_say_mute_after;
+        ctx_omni->duplex_say_finished = true;
+    }
+    print_with_timestamp("Duplex say: forced unit (%zu text tokens, last=%d): %s\n",
+                         text_toks.size(), (int)last, response.c_str());
+
+    if (!response.empty()) {
+        std::lock_guard<std::mutex> tl(ctx_omni->text_mtx);
+        ctx_omni->text_queue.push_back(response);
+        ctx_omni->text_cv.notify_all();
+    }
+    if (ctx_omni->use_tts && ctx_omni->tts_thread_info) {
+        LLMOut * llm_out = new LLMOut();
+        llm_out->text           = response;
+        llm_out->n_past         = ctx_omni->n_past;
+        llm_out->llm_finish     = true;
+        llm_out->debug_dir      = debug_dir;
+        llm_out->token_ids      = tts_ids;
+        llm_out->hidden_states  = tts_hidden;
+        llm_out->n_embd         = n_embd;
+        llm_out->is_end_of_turn = last;
+        {
+            std::unique_lock<std::mutex> lock(ctx_omni->tts_thread_info->mtx);
+            ctx_omni->tts_thread_info->cv.wait(lock, [&]{
+                return ctx_omni->tts_thread_info->queue.size()
+                       < (size_t)ctx_omni->tts_thread_info->MAX_QUEUE_SIZE;
+            });
+            ctx_omni->tts_thread_info->queue.push(llm_out);
+        }
+        ctx_omni->tts_thread_info->cv.notify_all();
+    }
+}
+
 static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
                              const std::string & debug_dir, int round_idx) {
     // ---- 轮次同步（与老 stream_decode 对齐） ----
@@ -10118,9 +10259,22 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
     // decode 开始时的 cache 长度（prefill 已完成写入，这里取值才准确）
     int decode_start_cache_len = ctx_omni->n_past;
 
-    // ---- force_listen：会话开局强制 LISTEN N 次 ----
-    if (ctx_omni->force_listen_used < ctx_omni->force_listen_count) {
-        ctx_omni->force_listen_used++;
+    // ---- session.say: a queued say replaces sampling (and pre-empts force_listen) ----
+    bool say_pending;
+    {
+        std::lock_guard<std::mutex> lk(ctx_omni->duplex_say_mtx);
+        say_pending = !ctx_omni->duplex_say_tokens.empty();
+    }
+    if (say_pending) {
+        ctx_omni->force_listen_used = std::max(ctx_omni->force_listen_used, ctx_omni->force_listen_count);
+        duplex_do_forced_speak(ctx_omni, params, debug_dir);
+        return duplex_finish_decode(ctx_omni, decode_start_cache_len, n_past_dec_0, t_dec_begin);
+    }
+    const bool muted = ctx_omni->duplex_muted.load();
+
+    // ---- force_listen：会话开局强制 LISTEN N 次；say(mute_after) 之后也一直 LISTEN ----
+    if (muted || ctx_omni->force_listen_used < ctx_omni->force_listen_count) {
+        if (!muted) ctx_omni->force_listen_used++;
         if (ctx_omni->special_token_listen >= 0) {
             common_sampler_accept(ctx_omni->ctx_sampler, ctx_omni->special_token_listen, true);
             std::vector<llama_token> tokens = {ctx_omni->special_token_listen};
@@ -10145,7 +10299,9 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
             ctx_omni->text_streaming = false;
             ctx_omni->text_cv.notify_all();
         }
-        return true;
+        // A mute can last many steps, so register its listen units with the sliding window
+        // like sampled ones; the few opening force_listen steps keep the upstream behaviour.
+        return muted ? duplex_finish_decode(ctx_omni, decode_start_cache_len, n_past_dec_0, t_dec_begin) : true;
     }
 
     // ---- 采样主循环（搬自老 stream_decode duplex 分支） ----
@@ -10316,6 +10472,13 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
         if (llm_finish) break;
     }
 
+    return duplex_finish_decode(ctx_omni, decode_start_cache_len, n_past_dec_0, t_dec_begin);
+}
+
+// Tail of a duplex decode step shared by the sampled and the forced (session.say) path:
+// end-of-turn marker, sliding-window response unit, round boundary, profiling line.
+static bool duplex_finish_decode(omni_context * ctx_omni, int decode_start_cache_len, int n_past_dec_0,
+                                 std::chrono::high_resolution_clock::time_point t_dec_begin) {
     // ---- 推送轮次结束标记 ----
     {
         std::lock_guard<std::mutex> tl(ctx_omni->text_mtx);
@@ -10740,6 +10903,7 @@ bool omni_duplex_reset_context(struct omni_context * ctx_omni, const std::string
         ctx_omni->text_done_flag = false;
         ctx_omni->text_streaming = false;
     }
+    omni_duplex_say_clear(ctx_omni);
     ctx_omni->system_prompt_initialized = false;
 
     const bool ok = stream_prefill(ctx_omni, ref_audio_path, "", 0);

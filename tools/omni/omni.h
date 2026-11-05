@@ -7,6 +7,7 @@
 #include <vector>
 #include <string>
 #include <queue>
+#include <deque>
 #include <mutex>
 #include <condition_variable>
 #include <chrono>
@@ -329,6 +330,17 @@ struct omni_context {
     int force_listen_count = 3;
     int force_listen_used  = 0;
 
+    // Forced speech (session.say, see docs/omni-duplex-say.md): text the client wants spoken
+    // verbatim. Each duplex step teacher-forces the next few words as a speaking unit instead
+    // of sampling, so the KV cache and the TTS see exactly what the model would have produced.
+    // Guarded by duplex_say_mtx (written by the ws thread, consumed by the llm thread).
+    std::mutex              duplex_say_mtx;
+    std::deque<llama_token> duplex_say_tokens;
+    int  duplex_say_chars_per_step = 12;      // ~1 s of speech: the duplex TTS budget per unit
+    bool duplex_say_mute_after     = false;   // after the last word, LISTEN until the next say
+    std::atomic<bool> duplex_muted{false};
+    std::atomic<bool> duplex_say_finished{false};  // set on the last unit; ws_handler reports it
+
     // TTS 采样温度（与 Python TTSSamplingParams.temperature 对齐，默认 0.8）
     // 通过 /v1/stream/update_session_config 的 "tts_temperature" 字段透传
     float tts_temperature = 0.8f;
@@ -548,6 +560,16 @@ bool stream_prefill(struct omni_context * ctx_omni,
 // prompt init (current omni_voice_clone_prompt/omni_assistant_prompt + ref audio)
 // without restarting threads or the session. TTS/T2W state is left untouched.
 bool omni_duplex_reset_context(struct omni_context * ctx_omni, const std::string & ref_audio_path);
+
+// Duplex only: queue text to be spoken verbatim as the assistant (docs/omni-duplex-say.md).
+// From the next decode step on, the model's own sampling is replaced by teacher-forced speaking
+// units of about chars_per_step characters until the text is used up. With mute_after the
+// session then emits LISTEN every step until the next say or reset. A new say replaces any
+// unfinished one. Returns the number of tokens queued (0 on error or empty text).
+int  omni_duplex_say(struct omni_context * ctx_omni, const std::string & text,
+                     int chars_per_step = 0, bool mute_after = false);
+// Drop any pending say and unmute.
+void omni_duplex_say_clear(struct omni_context * ctx_omni);
 
 bool stream_decode(struct omni_context * ctx_omni,
                         std::string debug_dir,

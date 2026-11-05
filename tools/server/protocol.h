@@ -74,6 +74,10 @@ json make_session_reset_done(const std::string & session_id,
                              bool ok,
                              const ProtocolMetrics & metrics);
 
+// Sent after the step that decoded the last unit of a session.say (its audio may still be
+// streaming). muted: the session now listens until the next say or reset.
+json make_session_say_done(const std::string & session_id, bool muted);
+
 json make_session_closed(const std::string & session_id,
                          const std::string & reason = "client_closed",
                          const std::string & diagnostic_message = "");

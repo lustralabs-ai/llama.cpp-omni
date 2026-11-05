@@ -212,6 +212,7 @@ static void reset_octx_for_session(omni_context * octx, const ParsedSessionInit 
     octx->wav_turn_base = 0;
     octx->round_start_positions.clear();
     octx->force_listen_used = 0;
+    omni_duplex_say_clear(octx);
 
     octx->tts_all_generated_tokens.clear();
     octx->tts_token_buffer.clear();
@@ -870,6 +871,38 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             continue;
         }
 
+        if (msg_type == "session.say") {
+            // Forced speech (duplex): the next steps speak payload.text verbatim instead of
+            // sampling; see docs/omni-duplex-say.md. Answered by session.say.done after the
+            // step that decodes the last words.
+            if (parsed_init.mode != "full_duplex") {
+                fail_fast(session_id, "say_unsupported_mode");
+                return;
+            }
+            const json & payload = msg.contains("payload") && msg.at("payload").is_object()
+                ? msg.at("payload") : json::object();
+            const std::string text = payload.contains("text") && payload.at("text").is_string()
+                ? payload.at("text").get<std::string>() : std::string();
+            const int chars_per_step = payload.contains("chars_per_step") && payload.at("chars_per_step").is_number_integer()
+                ? payload.at("chars_per_step").get<int>() : 0;
+            const bool mute_after = payload.contains("mute_after") && payload.at("mute_after").is_boolean()
+                && payload.at("mute_after").get<bool>();
+            int n_tokens;
+            {
+                std::lock_guard<std::mutex> lock(octx_mutex);
+                n_tokens = text.empty() ? 0 : omni_duplex_say(octx, text, chars_per_step, mute_after);
+            }
+            if (n_tokens == 0) {
+                // Nothing to speak; still honour mute_after so a client can mute without talking.
+                omni_duplex_say_clear(octx);
+                octx->duplex_muted = mute_after;
+                send_event(make_session_say_done(session_id, mute_after));
+            }
+            LOG_INF("WS /backend: session %s say (%d tokens, mute_after=%d)\n",
+                    session_id.c_str(), n_tokens, (int)mute_after);
+            continue;
+        }
+
         if (msg_type != "input.append") {
             // Unknown or invalid type after init → fail-fast
             LOG_ERR("WS /backend: unexpected message type '%s' from session %s\n",
@@ -1330,6 +1363,9 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                     make_runtime_metrics(octx, prefill_ms, generate_ms,
                                          elapsed_ms(t_request_start), 0,
                                          turn_vision_slices)));
+            }
+            if (octx->duplex_say_finished.exchange(false)) {
+                send_event(make_session_say_done(session_id, octx->duplex_muted.load()));
             }
         }
     }

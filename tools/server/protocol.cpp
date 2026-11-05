@@ -176,6 +176,15 @@ json make_session_reset_done(const std::string & session_id,
     return ev;
 }
 
+json make_session_say_done(const std::string & session_id, bool muted) {
+    json ev;
+    ev["type"] = "session.say.done";
+    ev["session_id"] = session_id;
+    ev["muted"] = muted;
+    ev["server_send_ts"] = server_timestamp();
+    return ev;
+}
+
 json make_session_closed(const std::string & session_id,
                           const std::string & reason,
                           const std::string & diagnostic_message) {
